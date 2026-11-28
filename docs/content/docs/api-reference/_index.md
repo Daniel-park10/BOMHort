@@ -409,13 +409,15 @@ Unlike the bucket/directory ingestion path, the server cannot infer these from a
 }
 ```
 
-With `DEDUP_BY_IMAGE_DIGEST=true` (Helm: `apiGateway.dedupByImageDigest`, default `false`), an upload with `?image=<ref>@sha256:<digest>` returns `200` with `"duplicate": true` if the digest already exists for the same cluster/namespace/project. For a different ownership tuple, BOMHort clones the existing parsed SBOM data and returns `"reused": true`; the uploaded document is not stored or parsed again. If identical content is still queued but has not yet been ingested, the upload returns `409` and can be retried after ingestion.
+Content deduplication is ownership-aware: an upload returns `200` with `"status": "duplicate"` if the identical content hash already exists for the same cluster, namespace, and project. For a different ownership tuple, BOMHort clones the existing parsed SBOM data and returns `200` with `"status": "reused"` and `"reused": true` without storing or parsing the document again. If identical content is still queued in the ingestion pipeline but has not yet been ingested, the upload returns `409` and can be retried once ingestion completes.
+
+With `DEDUP_BY_IMAGE_DIGEST=true` (Helm: `apiGateway.dedupByImageDigest`, default `false`), an upload with `?image=<ref>@sha256:<digest>` performs this deduplication and reuse keyed by container image digest.
 
 **Errors:**
 - `400` — Missing `X-Filename` header, unsupported file extension, empty body, malformed image/source metadata, or content that fails validation (SBOM uploads must be a single well-formed JSON object; VEX uploads must be a valid OpenVEX document — see below)
 - `403` — `AUTH_ENABLED` is not `true` on this instance
 - `413` — Body exceeds `MAX_UPLOAD_SIZE_MB`
-- `409` — Image digest reuse is enabled but identical content is still queued and has not been ingested yet
+- `409` — Identical SBOM content or image digest is already queued and has not been ingested yet
 - `500` — Storage (S3 or local) or ingestion-queue failure
 - `503` — No push-storage backend is configured (no `skipScan` S3 bucket, and `SBOM_DIR` isn't writable or is disabled with `SBOM_DIR_DISABLED=true`)
 

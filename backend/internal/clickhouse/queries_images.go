@@ -19,6 +19,8 @@ type ImageSBOMRef struct {
 	Cluster, Namespace string
 	Project            string
 	ImageRef           string
+	ImageDigest        string
+	SHA256Hash         string
 	Origin             string
 }
 
@@ -135,11 +137,11 @@ func (c *Client) ImageExists(ctx context.Context, digest string) (bool, error) {
 func (c *Client) QueryImageOwner(ctx context.Context, digest string) (*ImageSBOMRef, error) {
 	var ref ImageSBOMRef
 	err := c.Conn.QueryRow(ctx, `
-		SELECT sbom_id, cluster, namespace, project, image_ref, origin
+		SELECT sbom_id, cluster, namespace, project, image_ref, image_digest, toString(sha256_hash), origin
 		FROM sboms FINAL
 		WHERE image_digest = ?
 		ORDER BY ingested_at DESC
-		LIMIT 1`, digest).Scan(&ref.SBOMID, &ref.Cluster, &ref.Namespace, &ref.Project, &ref.ImageRef, &ref.Origin)
+		LIMIT 1`, digest).Scan(&ref.SBOMID, &ref.Cluster, &ref.Namespace, &ref.Project, &ref.ImageRef, &ref.ImageDigest, &ref.SHA256Hash, &ref.Origin)
 	if err != nil {
 		if isNoRows(err) {
 			return nil, nil
@@ -156,11 +158,11 @@ func (c *Client) FindImageByDigest(ctx context.Context, digest string) (*ImageSB
 func (c *Client) FindSBOMByHash(ctx context.Context, hash string) (*ImageSBOMRef, error) {
 	var ref ImageSBOMRef
 	err := c.Conn.QueryRow(ctx, `
-		SELECT sbom_id, cluster, namespace, project
+		SELECT sbom_id, cluster, namespace, project, image_ref, image_digest, toString(sha256_hash), origin
 		FROM sboms FINAL
 		WHERE sha256_hash = ?
 		ORDER BY ingested_at DESC
-		LIMIT 1`, hash).Scan(&ref.SBOMID, &ref.Cluster, &ref.Namespace, &ref.Project)
+		LIMIT 1`, hash).Scan(&ref.SBOMID, &ref.Cluster, &ref.Namespace, &ref.Project, &ref.ImageRef, &ref.ImageDigest, &ref.SHA256Hash, &ref.Origin)
 	if err != nil {
 		if isNoRows(err) {
 			return nil, nil
@@ -168,6 +170,36 @@ func (c *Client) FindSBOMByHash(ctx context.Context, hash string) (*ImageSBOMRef
 		return nil, fmt.Errorf("failed to query SBOM by content hash: %w", err)
 	}
 	return &ref, nil
+}
+
+func (c *Client) FindSBOMByHashOwner(ctx context.Context, hash, cluster, namespace, project, origin string) (*ImageSBOMRef, error) {
+	var ref ImageSBOMRef
+	err := c.Conn.QueryRow(ctx, `
+		SELECT sbom_id, cluster, namespace, project, image_ref, image_digest, toString(sha256_hash), origin
+		FROM sboms FINAL
+		WHERE sha256_hash = ? AND cluster = ? AND namespace = ? AND project = ?
+		ORDER BY ingested_at DESC
+		LIMIT 1`, hash, cluster, namespace, project).Scan(&ref.SBOMID, &ref.Cluster, &ref.Namespace, &ref.Project, &ref.ImageRef, &ref.ImageDigest, &ref.SHA256Hash, &ref.Origin)
+	if err != nil {
+		if isNoRows(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to query SBOM by hash and ownership: %w", err)
+	}
+	return &ref, nil
+}
+
+func (c *Client) FindPendingSBOMJob(ctx context.Context, hash, cluster, namespace, project, origin string) (*models.IngestionJob, error) {
+	jobs, err := c.selectJobs(ctx,
+		"latest_status IN ('pending', 'processing') AND sha256_hash = ? AND cluster = ? AND namespace = ? AND project = ?",
+		1, hash, cluster, namespace, project)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query pending SBOM job: %w", err)
+	}
+	if len(jobs) == 0 {
+		return nil, nil
+	}
+	return &jobs[0], nil
 }
 
 func (c *Client) FindPendingImageJob(ctx context.Context, digest, imageRef, cluster, namespace, project, origin string) (*models.IngestionJob, error) {
@@ -186,11 +218,11 @@ func (c *Client) FindPendingImageJob(ctx context.Context, digest, imageRef, clus
 func (c *Client) FindImageByDigestOwner(ctx context.Context, digest, imageRef, cluster, namespace, project, origin string) (*ImageSBOMRef, error) {
 	var ref ImageSBOMRef
 	err := c.Conn.QueryRow(ctx, `
-		SELECT sbom_id, cluster, namespace, project, image_ref, origin
+		SELECT sbom_id, cluster, namespace, project, image_ref, image_digest, toString(sha256_hash), origin
 		FROM sboms FINAL
 		WHERE image_digest = ? AND image_ref = ? AND cluster = ? AND namespace = ? AND project = ? AND origin = ?
 		ORDER BY ingested_at DESC
-		LIMIT 1`, digest, imageRef, cluster, namespace, project, origin).Scan(&ref.SBOMID, &ref.Cluster, &ref.Namespace, &ref.Project, &ref.ImageRef, &ref.Origin)
+		LIMIT 1`, digest, imageRef, cluster, namespace, project, origin).Scan(&ref.SBOMID, &ref.Cluster, &ref.Namespace, &ref.Project, &ref.ImageRef, &ref.ImageDigest, &ref.SHA256Hash, &ref.Origin)
 	if err != nil {
 		if isNoRows(err) {
 			return nil, nil
@@ -203,7 +235,21 @@ func (c *Client) FindImageByDigestOwner(ctx context.Context, digest, imageRef, c
 // CloneImageSBOM reuses the already-parsed SBOM data for another ownership
 // tuple. The deterministic target id makes retries replace partial child rows.
 func (c *Client) CloneImageSBOM(ctx context.Context, source ImageSBOMRef, digest, imageRef, sourceRepo, sourceRef, cluster, namespace, project, parent, origin string, tags []string) (string, error) {
-	identity, err := json.Marshal([]string{digest, imageRef, cluster, namespace, project, origin})
+	contentKey := digest
+	if contentKey == "" {
+		contentKey = source.ImageDigest
+	}
+	if contentKey == "" {
+		contentKey = source.SHA256Hash
+	}
+	if contentKey == "" {
+		contentKey = source.SBOMID.String()
+	}
+	effectiveImageRef := imageRef
+	if effectiveImageRef == "" {
+		effectiveImageRef = source.ImageRef
+	}
+	identity, err := json.Marshal([]string{contentKey, effectiveImageRef, cluster, namespace, project, origin})
 	if err != nil {
 		return "", fmt.Errorf("failed to encode cloned image identity: %w", err)
 	}
@@ -214,6 +260,10 @@ func (c *Client) CloneImageSBOM(ctx context.Context, source ImageSBOMRef, digest
 	}
 	if sourceExists == 0 {
 		return "", ErrImageNotFound
+	}
+	effectiveDigest := digest
+	if effectiveDigest == "" {
+		effectiveDigest = source.ImageDigest
 	}
 	cloneStatements := []struct {
 		table string
@@ -232,9 +282,9 @@ func (c *Client) CloneImageSBOM(ctx context.Context, source ImageSBOMRef, digest
 			       package_versions, package_purls, package_licenses, package_license_sources,
 			       rel_source_indices, rel_target_indices, rel_types, package_depths,
 			       if(length(license_discrepancy) = length(package_names), license_discrepancy, arrayResize(CAST([], 'Array(String)'), length(package_names), '')),
-			       ?, ?, ?, ?
+			       ?, ?, ?, if(? != '', ?, image_digest)
 			FROM sbom_packages FINAL WHERE sbom_id = ?`,
-			[]any{targetID, cluster, namespace, project, digest, source.SBOMID}},
+			[]any{targetID, cluster, namespace, project, effectiveDigest, effectiveDigest, source.SBOMID}},
 		{"vulnerabilities", `
 			INSERT INTO vulnerabilities (
 				discovered_at, sbom_id, source_file, purl, vuln_id, severity, summary,
@@ -246,9 +296,9 @@ func (c *Client) CloneImageSBOM(ctx context.Context, source ImageSBOMRef, digest
 			SELECT now(), ?, source_file, purl, vuln_id, severity, summary,
 			       affected_versions, fixed_version, osv_json, aliases, cwe_ids, dependency_depth,
 			       advisory_source, advisory_status, component_location,
-			       ?, ?, ?, ?, reachability, evidence_source, evidence_ref, evidence_at
+			       ?, ?, ?, if(? != '', ?, image_digest), reachability, evidence_source, evidence_ref, evidence_at
 			FROM vulnerabilities FINAL WHERE sbom_id = ?`,
-			[]any{targetID, cluster, namespace, project, digest, source.SBOMID}},
+			[]any{targetID, cluster, namespace, project, effectiveDigest, effectiveDigest, source.SBOMID}},
 		{"license_compliance", `
 			INSERT INTO license_compliance (
 				checked_at, sbom_id, source_file, license_id, category, package_count,
@@ -293,11 +343,11 @@ func (c *Client) CloneImageSBOM(ctx context.Context, source ImageSBOMRef, digest
 		       if(? != '', ?, source_repo), if(? != '', ?, source_ref),
 		       document_version, arraySort(arrayDistinct(arrayConcat(tags, ?))),
 		       if(? != '', ?, parent), root_purl, supplier, ?,
-		       ?, ?, quality_score, quality_flags
+		       if(? != '', ?, image_ref), if(? != '', ?, image_digest), quality_score, quality_flags
 		FROM sboms FINAL WHERE sbom_id = ?`,
 		targetID, cluster, namespace, project,
 		sourceRepo, sourceRepo, sourceRef, sourceRef, tags, parent, parent,
-		origin, imageRef, digest, source.SBOMID); err != nil {
+		origin, imageRef, imageRef, digest, digest, source.SBOMID); err != nil {
 		return "", fmt.Errorf("failed to commit cloned SBOM metadata: %w", err)
 	}
 	var targetExists uint64

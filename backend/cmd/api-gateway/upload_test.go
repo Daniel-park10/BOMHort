@@ -29,6 +29,7 @@ type fakeUploadStore struct {
 	enqueueErr    error
 	enqueuedJobs  []models.IngestionJob
 	imageOwner    *clickhouse.ImageSBOMRef
+	sbomOwner     *clickhouse.ImageSBOMRef
 	pendingJob    *models.IngestionJob
 }
 
@@ -44,7 +45,27 @@ func (f *fakeUploadStore) FindImageByDigestOwner(ctx context.Context, digest, im
 }
 
 func (f *fakeUploadStore) FindSBOMByHash(ctx context.Context, hash string) (*clickhouse.ImageSBOMRef, error) {
+	if f.sbomOwner != nil {
+		return f.sbomOwner, nil
+	}
 	return f.imageOwner, nil
+}
+
+func (f *fakeUploadStore) FindSBOMByHashOwner(ctx context.Context, hash, cluster, namespace, project, origin string) (*clickhouse.ImageSBOMRef, error) {
+	if f.hashExistsErr != nil {
+		return nil, f.hashExistsErr
+	}
+	if f.sbomOwner != nil && f.sbomOwner.Cluster == cluster && f.sbomOwner.Namespace == namespace && f.sbomOwner.Project == project {
+		return f.sbomOwner, nil
+	}
+	if f.imageOwner != nil && f.imageOwner.Cluster == cluster && f.imageOwner.Namespace == namespace && f.imageOwner.Project == project {
+		return f.imageOwner, nil
+	}
+	return nil, nil
+}
+
+func (f *fakeUploadStore) FindPendingSBOMJob(ctx context.Context, hash, cluster, namespace, project, origin string) (*models.IngestionJob, error) {
+	return f.pendingJob, nil
 }
 
 func (f *fakeUploadStore) FindPendingImageJob(ctx context.Context, digest, imageRef, cluster, namespace, project, origin string) (*models.IngestionJob, error) {
@@ -466,7 +487,13 @@ func TestUploadHandler_UnsupportedExtension(t *testing.T) {
 
 func TestUploadHandler_DuplicateContentHash(t *testing.T) {
 	cfg := testUploadConfig(t)
-	store := &fakeUploadStore{hashExists: true}
+	store := &fakeUploadStore{
+		sbomOwner: &clickhouse.ImageSBOMRef{
+			Cluster:   cfg.ClusterName,
+			Namespace: cfg.Namespace,
+			Project:   cfg.Project,
+		},
+	}
 	h := localUploadHandler(cfg, store)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/sboms/upload", bytes.NewReader([]byte(`{"bomFormat":"CycloneDX"}`)))
@@ -491,6 +518,139 @@ func TestUploadHandler_DuplicateContentHash(t *testing.T) {
 
 	// The staged temp file must be cleaned up — a duplicate must not leave
 	// anything behind in SBOM_DIR/pushed/.
+	assertNoFilesInPushedDir(t, cfg)
+}
+
+func TestUploadHandler_KnownContentDifferentProject_Reused(t *testing.T) {
+	cfg := testUploadConfig(t)
+	existingID := uuid.New()
+	store := &fakeUploadStore{
+		sbomOwner: &clickhouse.ImageSBOMRef{
+			SBOMID:    existingID,
+			Cluster:   "default-cluster",
+			Namespace: "shop",
+			Project:   "web",
+		},
+	}
+	h := localUploadHandler(cfg, store)
+
+	// Upload identical content for a different project ("worker")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sboms/upload?namespace=shop&project=worker", bytes.NewReader([]byte(`{"bomFormat":"CycloneDX"}`)))
+	req.Header.Set("X-Filename", "app.cdx.json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for reused content on new project, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp["status"] != "reused" {
+		t.Errorf("expected status=reused, got %v", resp["status"])
+	}
+	if resp["reused"] != true {
+		t.Errorf("expected reused=true, got %v", resp["reused"])
+	}
+	if resp["duplicate"] != false {
+		t.Errorf("expected duplicate=false, got %v", resp["duplicate"])
+	}
+	if resp["sbom_id"] != "cloned-sbom-id" {
+		t.Errorf("expected sbom_id=cloned-sbom-id, got %v", resp["sbom_id"])
+	}
+	if len(store.enqueuedJobs) != 0 {
+		t.Errorf("reused content must not enqueue a job, got %d", len(store.enqueuedJobs))
+	}
+	assertNoFilesInPushedDir(t, cfg)
+}
+
+func TestUploadHandler_KnownContentDifferentCluster_Reused(t *testing.T) {
+	cfg := testUploadConfig(t)
+	existingID := uuid.New()
+	store := &fakeUploadStore{
+		sbomOwner: &clickhouse.ImageSBOMRef{
+			SBOMID:    existingID,
+			Cluster:   "prod-a",
+			Namespace: "default",
+			Project:   "api",
+		},
+	}
+	h := localUploadHandler(cfg, store)
+
+	// Upload identical content for cluster "prod-b"
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sboms/upload?cluster=prod-b&namespace=default&project=api", bytes.NewReader([]byte(`{"bomFormat":"CycloneDX"}`)))
+	req.Header.Set("X-Filename", "app.cdx.json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for reused content on new cluster, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp["status"] != "reused" || resp["reused"] != true {
+		t.Errorf("unexpected response: %+v", resp)
+	}
+	if len(store.enqueuedJobs) != 0 {
+		t.Errorf("reused content must not enqueue a job, got %d", len(store.enqueuedJobs))
+	}
+	assertNoFilesInPushedDir(t, cfg)
+}
+
+func TestUploadHandler_KnownContentPendingJob_SameOwnership(t *testing.T) {
+	cfg := testUploadConfig(t)
+	jobID := uuid.New()
+	store := &fakeUploadStore{
+		pendingJob: &models.IngestionJob{
+			JobID: jobID,
+		},
+	}
+	h := localUploadHandler(cfg, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sboms/upload?namespace=shop&project=web", bytes.NewReader([]byte(`{"bomFormat":"CycloneDX"}`)))
+	req.Header.Set("X-Filename", "app.cdx.json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 for pending upload, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp["status"] != "pending" || resp["job_id"] != jobID.String() {
+		t.Errorf("unexpected response: %+v", resp)
+	}
+	if len(store.enqueuedJobs) != 0 {
+		t.Errorf("pending content must not enqueue another job, got %d", len(store.enqueuedJobs))
+	}
+	assertNoFilesInPushedDir(t, cfg)
+}
+
+func TestUploadHandler_KnownContentQueuedOtherOwnership_Conflict(t *testing.T) {
+	cfg := testUploadConfig(t)
+	// Hash exists in queue, but sbomOwner is nil (not yet ingested into sboms)
+	store := &fakeUploadStore{
+		hashExists: true,
+	}
+	h := localUploadHandler(cfg, store)
+
+	// Upload for a different project
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sboms/upload?namespace=shop&project=worker", bytes.NewReader([]byte(`{"bomFormat":"CycloneDX"}`)))
+	req.Header.Set("X-Filename", "app.cdx.json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when identical content is queued, got %d: %s", rec.Code, rec.Body.String())
+	}
 	assertNoFilesInPushedDir(t, cfg)
 }
 

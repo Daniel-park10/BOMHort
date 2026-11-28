@@ -139,3 +139,86 @@ func TestCloneImageSBOMCopiesRelatedRowsAndIsIdempotent(t *testing.T) {
 		t.Errorf("QueryImage omitted cloned SBOM %s", id)
 	}
 }
+
+func TestCloneSBOMByContentHashWithoutImageDigest(t *testing.T) {
+	c := testClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	sourceID := uuid.New()
+	hash := strings.Repeat("b", 64)
+	identity, err := json.Marshal([]string{hash, "", "target-cluster", "team", "worker", "ci"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetID := uuid.NewSHA1(uuid.NameSpaceURL, identity)
+	for _, table := range []string{"sbom_packages", "vulnerabilities", "license_compliance", "document_store", "vex_statements", "sboms"} {
+		table := table
+		t.Cleanup(func() {
+			if err := c.Conn.Exec(context.Background(), "ALTER TABLE "+table+" DELETE WHERE sbom_id IN (?, ?) SETTINGS mutations_sync = 1", sourceID, targetID); err != nil {
+				t.Errorf("cleanup %s: %v", table, err)
+			}
+		})
+	}
+
+	now := time.Now()
+	source := models.SBOM{
+		IngestedAt: now, SBOMID: sourceID, SourceFile: "host-scan.json",
+		SPDXVersion: "SPDX-2.3", DocumentName: "host-test", SHA256Hash: hash,
+		CreationDate: now, CreatorTools: []string{}, Tags: []string{}, QualityFlags: []string{},
+		Cluster: "source-cluster", Namespace: "team", Project: "web",
+	}
+	if err := c.InsertSBOM(ctx, &source); err != nil {
+		t.Fatal(err)
+	}
+	packages := models.SBOMPackages{
+		IngestedAt: now, SBOMID: sourceID, SourceFile: source.SourceFile,
+		PackageSPDXIDs: []string{"SPDXRef-Root"}, PackageNames: []string{"root"},
+		PackageVersions: []string{"1"}, PackagePURLs: []string{"pkg:generic/root@1"},
+		PackageLicenses: []string{"MIT"}, PackageLicenseSources: []string{"declared"},
+		PackageDepths: []uint16{0}, Cluster: source.Cluster, Namespace: source.Namespace, Project: source.Project,
+	}
+	if err := c.InsertSBOMPackages(ctx, &packages); err != nil {
+		t.Fatal(err)
+	}
+
+	owner, err := c.FindSBOMByHashOwner(ctx, hash, "source-cluster", "team", "web", "")
+	if err != nil {
+		t.Fatalf("FindSBOMByHashOwner: %v", err)
+	}
+	if owner == nil || owner.SBOMID != sourceID {
+		t.Fatalf("FindSBOMByHashOwner = %+v, want sourceID %s", owner, sourceID)
+	}
+
+	diffOwner, err := c.FindSBOMByHashOwner(ctx, hash, "source-cluster", "team", "worker", "")
+	if err != nil {
+		t.Fatalf("FindSBOMByHashOwner: %v", err)
+	}
+	if diffOwner != nil {
+		t.Fatalf("FindSBOMByHashOwner should be nil for different project, got %+v", diffOwner)
+	}
+
+	foundSBOM, err := c.FindSBOMByHash(ctx, hash)
+	if err != nil {
+		t.Fatalf("FindSBOMByHash: %v", err)
+	}
+	if foundSBOM == nil || foundSBOM.SBOMID != sourceID {
+		t.Fatalf("FindSBOMByHash = %+v, want %s", foundSBOM, sourceID)
+	}
+
+	clonedID, err := c.CloneImageSBOM(ctx, *foundSBOM, "", "", "", "", "target-cluster", "team", "worker", "", "ci", []string{"fleet"})
+	if err != nil {
+		t.Fatalf("CloneImageSBOM: %v", err)
+	}
+	if clonedID != targetID.String() {
+		t.Fatalf("clone ID = %s, want deterministic %s", clonedID, targetID)
+	}
+
+	clonedOwner, err := c.FindSBOMByHashOwner(ctx, hash, "target-cluster", "team", "worker", "ci")
+	if err != nil {
+		t.Fatalf("FindSBOMByHashOwner: %v", err)
+	}
+	if clonedOwner == nil || clonedOwner.SBOMID != targetID {
+		t.Fatalf("FindSBOMByHashOwner = %+v, want targetID %s", clonedOwner, targetID)
+	}
+}

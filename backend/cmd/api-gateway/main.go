@@ -1729,6 +1729,8 @@ type uploadStore interface {
 	FindImageByDigestOwner(ctx context.Context, digest, imageRef, cluster, namespace, project, origin string) (*clickhouse.ImageSBOMRef, error)
 	FindPendingImageJob(ctx context.Context, digest, imageRef, cluster, namespace, project, origin string) (*models.IngestionJob, error)
 	FindSBOMByHash(ctx context.Context, hash string) (*clickhouse.ImageSBOMRef, error)
+	FindSBOMByHashOwner(ctx context.Context, hash, cluster, namespace, project, origin string) (*clickhouse.ImageSBOMRef, error)
+	FindPendingSBOMJob(ctx context.Context, hash, cluster, namespace, project, origin string) (*models.IngestionJob, error)
 	CloneImageSBOM(ctx context.Context, source clickhouse.ImageSBOMRef, digest, imageRef, sourceRepo, sourceRef, cluster, namespace, project, parent, origin string, tags []string) (string, error)
 	EnqueueJobs(ctx context.Context, jobs []models.IngestionJob) error
 }
@@ -1948,81 +1950,6 @@ func uploadHandler(deps uploadDeps) http.HandlerFunc {
 
 		hash := hex.EncodeToString(hasher.Sum(nil))
 		process := func(w http.ResponseWriter, r *http.Request) {
-			// Dedup: skip re-ingesting content BOMHort has already processed. This
-			// is checked before content validation so repeat pushes of a file
-			// that's already been ingested don't pay the parse cost again.
-			//
-			// For non-image uploads this check is not atomic with EnqueueJobs; the
-			// worker's SBOMExists/VEXDocumentExists guards make a duplicate harmless.
-			exists, err := store.HashExists(r.Context(), hash)
-			if err != nil {
-				log.Printf("ERROR: upload hash check for %s: %v", sanitizeLogParam(filename), err)
-				writeError(w, http.StatusInternalServerError, "Failed to check for duplicate upload")
-				return
-			}
-			if exists && !(cfg.DedupByImageDigest && imageDigest != "") {
-				writeJSON(w, http.StatusOK, map[string]string{
-					"status":      "duplicate",
-					"sha256_hash": hash,
-					"message":     "Content already ingested, skipping",
-				})
-				return
-			}
-
-			// Validate content before persisting/enqueueing so bad uploads fail
-			// fast with a 400 instead of a 202 that silently fails in the worker
-			// minutes later. This intentionally stays lightweight: a full parse
-			// (package/component extraction) belongs to the parsing-worker, not
-			// here — duplicating it would undercut the point of the push model,
-			// which is to reuse the existing ingestion pipeline unmodified.
-			if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-				log.Printf("ERROR: upload seek for %s: %v", sanitizeLogParam(filename), err)
-				writeError(w, http.StatusInternalServerError, "Failed to validate upload")
-				return
-			}
-			switch fileType {
-			case models.JobTypeVEX:
-				if _, err := vex.Parse(tmp, filename); err != nil {
-					writeError(w, http.StatusBadRequest, "Invalid VEX content: "+err.Error())
-					return
-				}
-			default: // sbom
-				// We don't require a recognized format marker
-				// (bomFormat/spdxVersion/predicateType) to be present — sbom.Parse
-				// falls back to the SPDX parser for unrecognized shapes and handles
-				// unknown input gracefully. We only need to catch content that isn't
-				// a well-formed JSON document.
-				//
-				// Decode into json.RawMessage rather than a typed probe struct:
-				// Decode reads exactly one JSON value and silently ignores anything
-				// after it, and a bare `null` decodes successfully into any struct.
-				// Both would let malformed payloads through with a 202 and defer the
-				// failure to the worker — the exact outcome this check exists to
-				// prevent. The trailing-data and object-shape checks below close that gap.
-				dec := json.NewDecoder(tmp)
-				var raw json.RawMessage
-				if err := dec.Decode(&raw); err != nil {
-					writeError(w, http.StatusBadRequest, "Invalid SBOM content: not valid JSON")
-					return
-				}
-				// A second Decode must hit io.EOF, i.e. nothing but whitespace follows
-				// the first document. Deliberately not dec.More(), which is
-				// `peek() != ']' && peek() != '}'` — that catches `{...}{...}` and
-				// `{...} junk`, but reports false for a trailing `]` or `}`, so
-				// `{"spdxVersion":"x"}]` would slip through as a valid document.
-				if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
-					writeError(w, http.StatusBadRequest, "Invalid SBOM content: unexpected trailing data after the JSON document")
-					return
-				}
-				// Every supported SBOM format (SPDX, CycloneDX, in-toto envelope) is
-				// a JSON object at the top level. null / arrays / bare scalars are
-				// syntactically valid JSON but can never be a parseable SBOM.
-				if len(raw) == 0 || raw[0] != '{' {
-					writeError(w, http.StatusBadRequest, "Invalid SBOM content: expected a JSON object at the top level")
-					return
-				}
-			}
-
 			// Ownership dimensions: query params override this instance's configured
 			// defaults. Deliberately query params rather than headers, matching the
 			// existing ?cluster= contract (#131) -- a pushing CI job names where the
@@ -2084,7 +2011,25 @@ func uploadHandler(deps uploadDeps) http.HandlerFunc {
 				}
 			}
 
-			if cfg.DedupByImageDigest && imageDigest != "" {
+			// Dedup / reuse: skip re-ingesting content BOMHort has already processed.
+			// This is checked before content validation so repeat pushes of a file
+			// that's already been ingested don't pay the parse cost again.
+			if fileType == models.JobTypeVEX {
+				exists, err := store.HashExists(r.Context(), hash)
+				if err != nil {
+					log.Printf("ERROR: upload hash check for %s: %v", sanitizeLogParam(filename), err)
+					writeError(w, http.StatusInternalServerError, "Failed to check for duplicate upload")
+					return
+				}
+				if exists {
+					writeJSON(w, http.StatusOK, map[string]string{
+						"status":      "duplicate",
+						"sha256_hash": hash,
+						"message":     "Content already ingested, skipping",
+					})
+					return
+				}
+			} else if cfg.DedupByImageDigest && imageDigest != "" {
 				matchingOwner, err := store.FindImageByDigestOwner(r.Context(), imageDigest, imageRef, cluster, namespace, project, uploadOrigin)
 				if err != nil {
 					log.Printf("ERROR: image dedup check: %v", err)
@@ -2121,16 +2066,24 @@ func uploadHandler(deps uploadDeps) http.HandlerFunc {
 					writeError(w, http.StatusInternalServerError, "Failed to look up existing image")
 					return
 				}
-				if existingImage == nil && exists {
-					existingImage, err = store.FindSBOMByHash(r.Context(), hash)
+				if existingImage == nil {
+					exists, err := store.HashExists(r.Context(), hash)
 					if err != nil {
-						log.Printf("ERROR: source SBOM lookup for image reuse: %v", err)
-						writeError(w, http.StatusInternalServerError, "Failed to look up existing SBOM")
+						log.Printf("ERROR: upload hash check for %s: %v", sanitizeLogParam(filename), err)
+						writeError(w, http.StatusInternalServerError, "Failed to check for duplicate upload")
 						return
 					}
-					if existingImage == nil {
-						writeError(w, http.StatusConflict, "Identical SBOM content is already queued; retry the image upload after ingestion completes")
-						return
+					if exists {
+						existingImage, err = store.FindSBOMByHash(r.Context(), hash)
+						if err != nil {
+							log.Printf("ERROR: source SBOM lookup for image reuse: %v", err)
+							writeError(w, http.StatusInternalServerError, "Failed to look up existing SBOM")
+							return
+						}
+						if existingImage == nil {
+							writeError(w, http.StatusConflict, "Identical SBOM content is already queued; retry the image upload after ingestion completes")
+							return
+						}
 					}
 				}
 				if existingImage != nil {
@@ -2147,6 +2100,122 @@ func uploadHandler(deps uploadDeps) http.HandlerFunc {
 						"sbom_id":      sbomID,
 						"image_digest": imageDigest,
 					})
+					return
+				}
+			} else {
+				matchingOwner, err := store.FindSBOMByHashOwner(r.Context(), hash, cluster, namespace, project, uploadOrigin)
+				if err != nil {
+					log.Printf("ERROR: upload hash check for %s: %v", sanitizeLogParam(filename), err)
+					writeError(w, http.StatusInternalServerError, "Failed to check for duplicate upload")
+					return
+				}
+				if matchingOwner != nil {
+					writeJSON(w, http.StatusOK, map[string]string{
+						"status":      "duplicate",
+						"sha256_hash": hash,
+						"sbom_id":     matchingOwner.SBOMID.String(),
+						"message":     "Content already ingested, skipping",
+					})
+					return
+				}
+				pendingJob, err := store.FindPendingSBOMJob(r.Context(), hash, cluster, namespace, project, uploadOrigin)
+				if err != nil {
+					log.Printf("ERROR: pending SBOM job lookup for %s: %v", sanitizeLogParam(filename), err)
+					writeError(w, http.StatusInternalServerError, "Failed to check for a pending upload")
+					return
+				}
+				if pendingJob != nil {
+					writeJSON(w, http.StatusAccepted, map[string]string{
+						"status":      "pending",
+						"job_id":      pendingJob.JobID.String(),
+						"sha256_hash": hash,
+					})
+					return
+				}
+				existingSBOM, err := store.FindSBOMByHash(r.Context(), hash)
+				if err != nil {
+					log.Printf("ERROR: source SBOM lookup for content reuse: %v", err)
+					writeError(w, http.StatusInternalServerError, "Failed to look up existing SBOM")
+					return
+				}
+				if existingSBOM != nil {
+					sbomID, err := store.CloneImageSBOM(r.Context(), *existingSBOM, imageDigest, imageRef, sourceRepoHdr, sourceRefHdr, cluster, namespace, project, parent, uploadOrigin, uploadTags)
+					if err != nil {
+						log.Printf("ERROR: clone SBOM by content hash: %v", err)
+						writeError(w, http.StatusInternalServerError, "Failed to reuse existing SBOM")
+						return
+					}
+					writeJSON(w, http.StatusOK, map[string]any{
+						"status":      "reused",
+						"duplicate":   false,
+						"reused":      true,
+						"sbom_id":     sbomID,
+						"sha256_hash": hash,
+					})
+					return
+				}
+				exists, err := store.HashExists(r.Context(), hash)
+				if err != nil {
+					log.Printf("ERROR: upload hash check for %s: %v", sanitizeLogParam(filename), err)
+					writeError(w, http.StatusInternalServerError, "Failed to check for duplicate upload")
+					return
+				}
+				if exists {
+					writeError(w, http.StatusConflict, "Identical SBOM content is already queued; retry the upload after ingestion completes")
+					return
+				}
+			}
+
+			// Validate content before persisting/enqueueing so bad uploads fail
+			// fast with a 400 instead of a 202 that silently fails in the worker
+			// minutes later. This intentionally stays lightweight: a full parse
+			// (package/component extraction) belongs to the parsing-worker, not
+			// here — duplicating it would undercut the point of the push model,
+			// which is to reuse the existing ingestion pipeline unmodified.
+			if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+				log.Printf("ERROR: upload seek for %s: %v", sanitizeLogParam(filename), err)
+				writeError(w, http.StatusInternalServerError, "Failed to validate upload")
+				return
+			}
+			switch fileType {
+			case models.JobTypeVEX:
+				if _, err := vex.Parse(tmp, filename); err != nil {
+					writeError(w, http.StatusBadRequest, "Invalid VEX content: "+err.Error())
+					return
+				}
+			default: // sbom
+				// We don't require a recognized format marker
+				// (bomFormat/spdxVersion/predicateType) to be present — sbom.Parse
+				// falls back to the SPDX parser for unrecognized shapes and handles
+				// unknown input gracefully. We only need to catch content that isn't
+				// a well-formed JSON document.
+				//
+				// Decode into json.RawMessage rather than a typed probe struct:
+				// Decode reads exactly one JSON value and silently ignores anything
+				// after it, and a bare `null` decodes successfully into any struct.
+				// Both would let malformed payloads through with a 202 and defer the
+				// failure to the worker — the exact outcome this check exists to
+				// prevent. The trailing-data and object-shape checks below close that gap.
+				dec := json.NewDecoder(tmp)
+				var raw json.RawMessage
+				if err := dec.Decode(&raw); err != nil {
+					writeError(w, http.StatusBadRequest, "Invalid SBOM content: not valid JSON")
+					return
+				}
+				// A second Decode must hit io.EOF, i.e. nothing but whitespace follows
+				// the first document. Deliberately not dec.More(), which is
+				// `peek() != ']' && peek() != '}'` — that catches `{...}{...}` and
+				// `{...} junk`, but reports false for a trailing `]` or `}`, so
+				// `{"spdxVersion":"x"}]` would slip through as a valid document.
+				if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
+					writeError(w, http.StatusBadRequest, "Invalid SBOM content: unexpected trailing data after the JSON document")
+					return
+				}
+				// Every supported SBOM format (SPDX, CycloneDX, in-toto envelope) is
+				// a JSON object at the top level. null / arrays / bare scalars are
+				// syntactically valid JSON but can never be a parseable SBOM.
+				if len(raw) == 0 || raw[0] != '{' {
+					writeError(w, http.StatusBadRequest, "Invalid SBOM content: expected a JSON object at the top level")
 					return
 				}
 			}
